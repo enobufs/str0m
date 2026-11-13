@@ -1445,7 +1445,11 @@ impl Session {
             return;
         };
         let is_overuse = bwe.is_overusing();
-        let minimum = bwe.minimum_bitrate();
+        // Pad up to the loss-based estimate while it recovers after loss, so the acknowledged
+        // rate that bounds the recovery can grow.
+        let minimum = bwe
+            .minimum_bitrate()
+            .max(bwe.loss_padding_rate().unwrap_or(Bitrate::ZERO));
 
         let has_active_media = self.has_active_outgoing_media();
 

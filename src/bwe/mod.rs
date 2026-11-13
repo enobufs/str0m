@@ -132,6 +132,11 @@ impl Bwe {
     pub fn minimum_bitrate(&self) -> Bitrate {
         self.minimum_bitrate
     }
+
+    /// Padding the loss controller wants while recovering after loss, if any.
+    pub fn loss_padding_rate(&self) -> Option<Bitrate> {
+        self.bwe.loss_controller.padding_rate()
+    }
 }
 
 struct SendSideBandwidthEstimator {
@@ -374,7 +379,10 @@ impl SendSideBandwidthEstimator {
         match self.loss_controller.loss_based_result().state {
             LossControllerState::DelayBased => BandwidthLimitedCause::DelayBasedLimited,
             LossControllerState::Increasing => BandwidthLimitedCause::LossLimitedBweIncreasing,
-            LossControllerState::Decreasing => BandwidthLimitedCause::LossLimitedBwe,
+            // Probes may not be sent while padding (as in WebRTC).
+            LossControllerState::Decreasing | LossControllerState::IncreaseUsingPadding => {
+                BandwidthLimitedCause::LossLimitedBwe
+            }
         }
     }
 
@@ -390,7 +398,9 @@ impl SendSideBandwidthEstimator {
                 // Loss controller defers to delay-based estimate
                 delay_estimate
             }
-            LossControllerState::Decreasing | LossControllerState::Increasing => {
+            LossControllerState::Decreasing
+            | LossControllerState::Increasing
+            | LossControllerState::IncreaseUsingPadding => {
                 // Loss controller is actively limiting or recovering
                 match (delay_estimate, loss_result.bandwidth_estimate) {
                     (Some(de), Some(le)) => Some(de.min(le)),

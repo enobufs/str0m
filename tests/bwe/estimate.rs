@@ -100,26 +100,24 @@ fn estimate_recovers_after_capacity_restoration() -> Result<(), RtcError> {
                 .link(Bitrate::mbps(5), DataSize::kbytes(100))
                 .seed(42),
         },
-        // Initial recovery should be via AIMD (no probes immediately after restoration)
+        // The loss-based estimate is bounded below by the acked rate, so the controller leaves
+        // the loss-limited state soon after the loss stops, and probing toward the desired
+        // bitrate recovers the estimate within seconds (≥ 2 Mbps after 3 s, measured).
         Step::Run {
-            description: "Initial AIMD recovery period",
+            description: "Initial recovery period",
             duration: Duration::from_secs(3),
         },
-        Step::AssertNoProbes {
-            description: "No probes during initial AIMD recovery",
-        },
         Step::Check {
-            description: "AIMD recovery is very slow after severe degradation",
-            at_least: Bitrate::kbps(350),
+            description: "Recovery is fast once the loss is gone",
+            at_least: Bitrate::kbps(1_500),
         },
-        // Further recovery via AIMD and eventually exponential probes
         Step::Run {
-            description: "Continue recovery (slow due to low threshold)",
+            description: "Continue recovery",
             duration: Duration::from_secs(25),
         },
         Step::Check {
-            description: "Recovery remains slow (threshold adapted down)",
-            at_least: Bitrate::mbps(1),
+            description: "Estimate close to the restored capacity (≥ 3 Mbps, measured)",
+            at_least: Bitrate::kbps(2_500),
         },
     ];
 
