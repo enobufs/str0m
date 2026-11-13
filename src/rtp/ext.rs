@@ -1084,6 +1084,28 @@ impl UserExtensionValues {
 
 impl UnwindSafe for UserExtensionValues {}
 
+impl UserExtensionValues {
+    /// Whether no user value is set.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.as_ref().is_none_or(|m| m.is_empty())
+    }
+}
+
+/// Where an outgoing RTP packet sits within its frame.
+///
+/// In frame mode, str0m's packetizer sets this in [`ExtensionValues::user_values`] of every
+/// packet of a frame that carries user values, so an [`ExtensionSerializer`] can write
+/// per-packet values: e.g. the Dependency Descriptor's start- and end-of-frame bits, or a
+/// value that only the first packet should carry. Retransmissions keep the value of the
+/// original packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePosition {
+    /// The first packet of the frame.
+    pub first: bool,
+    /// The last packet of the frame.
+    pub last: bool,
+}
+
 impl fmt::Debug for ExtensionValues {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ExtensionValues {{")?;

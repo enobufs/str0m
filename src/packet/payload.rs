@@ -3,7 +3,7 @@ use std::time::Instant;
 use crate::format::{CodecSpec, Vp9PacketizerMode};
 use crate::media::ToPayload;
 use crate::rtp::vla::VideoLayersAllocation;
-use crate::rtp_::{ExtensionValues, Frequency, Pt, SeqNo};
+use crate::rtp_::{ExtensionValues, FramePosition, Frequency, Pt, SeqNo};
 use crate::streams::{RtpWrite, StreamTx};
 
 use super::PacketError;
@@ -94,6 +94,10 @@ impl Payloader {
             let nackable = self.pack.nackable();
 
             let mut pkt_ext_vals = ext_vals.clone();
+
+            if !ext_vals.user_values.is_empty() {
+                pkt_ext_vals.user_values.set(FramePosition { first, last });
+            }
 
             if !first {
                 pkt_ext_vals.abs_capture_time = None;
@@ -194,6 +198,116 @@ impl PacketSink for RedSink<'_> {
             .marker(packet.marker)
             .ext_vals(packet.ext_vals)
             .nackable(packet.nackable),
+        );
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::format::{Codec, FormatParams};
+    use crate::rtp_::MediaTime;
+
+    #[derive(Default)]
+    struct VecSink {
+        seq: u64,
+        packets: Vec<OutgoingPacket>,
+    }
+
+    impl PacketSink for VecSink {
+        fn next_seq_no(&mut self) -> SeqNo {
+            self.seq += 1;
+            self.seq.into()
+        }
+        fn last_packet(&self) -> Option<&[u8]> {
+            self.packets.last().map(|p| p.payload.as_slice())
+        }
+        fn send(&mut self, packet: OutgoingPacket) {
+            self.packets.push(packet);
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Marker(u8);
+
+    fn packetize(ext_vals: ExtensionValues) -> Vec<OutgoingPacket> {
+        let spec = CodecSpec {
+            codec: Codec::H264,
+            clock_rate: Frequency::NINETY_KHZ,
+            channels: None,
+            format: FormatParams {
+                packetization_mode: Some(1),
+                ..Default::default()
+            },
+        };
+        let mut payloader = Payloader::new(spec, Vp9PacketizerMode::default());
+        // One IDR NAL unit (type 5) large enough for FU-A fragmentation into 3 packets.
+        let mut data = vec![0, 0, 0, 1, 0x65];
+        data.extend(std::iter::repeat_n(0xAB, 2500));
+        let mut sink = VecSink::default();
+        payloader
+            .push_sample(
+                ToPayload {
+                    pt: 96.into(),
+                    rid: None,
+                    wallclock: Instant::now(),
+                    rtp_time: MediaTime::from_90khz(0),
+                    not_before: None,
+                    start_of_talk_spurt: false,
+                    data: Arc::from(data),
+                    ext_vals,
+                },
+                1200,
+                &mut sink,
+            )
+            .unwrap();
+        sink.packets
+    }
+
+    #[test]
+    fn frame_position_is_set_per_packet_with_user_values() {
+        let mut ext_vals = ExtensionValues::default();
+        ext_vals.user_values.set(Marker(7));
+        let packets = packetize(ext_vals);
+        assert_eq!(packets.len(), 3);
+        let positions: Vec<_> = packets
+            .iter()
+            .map(|p| *p.ext_vals.user_values.get::<FramePosition>().unwrap())
+            .collect();
+        assert_eq!(
+            positions,
+            [
+                FramePosition {
+                    first: true,
+                    last: false
+                },
+                FramePosition {
+                    first: false,
+                    last: false
+                },
+                FramePosition {
+                    first: false,
+                    last: true
+                },
+            ]
+        );
+        // The frame's own user values are on every packet.
+        assert!(
+            packets
+                .iter()
+                .all(|p| p.ext_vals.user_values.get::<Marker>() == Some(&Marker(7)))
+        );
+    }
+
+    #[test]
+    fn no_frame_position_without_user_values() {
+        let packets = packetize(ExtensionValues::default());
+        assert!(
+            packets
+                .iter()
+                .all(|p| p.ext_vals.user_values.get::<FramePosition>().is_none())
         );
     }
 }
