@@ -787,8 +787,9 @@ pub mod rtp {
 
     /// Video Layers Allocation RTP Header Extension
     pub mod vla;
-    pub use crate::rtp_::{AbsCaptureTime, ExtensionValues, FramePosition, UserExtensionValues};
+    pub use crate::rtp_::{AbsCaptureTime, ExtensionValues, UserExtensionValues};
     pub use crate::rtp_::{Extension, ExtensionMap, ExtensionSerializer};
+    pub use crate::rtp_::{FirstPacketUserValues, FramePosition};
 
     pub use crate::packet::{
         RedBlock, RedDecoder, RedEncoder, RedundantBlock, Vp8Descriptor, Vp8DescriptorError,

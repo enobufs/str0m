@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::rtp::vla::VideoLayersAllocation;
-use crate::rtp_::{ExtensionValues, MediaTime, RtpHeader, SenderInfo, SeqNo};
+use crate::rtp_::{
+    ExtensionValues, FirstPacketUserValues, MediaTime, RtpHeader, SenderInfo, SeqNo,
+};
 
 use super::contiguity::Contiguity;
 use super::contiguity_vp8::Vp8Contiguity;
@@ -107,6 +109,12 @@ impl Depacketized {
 
         if let Some(first_val) = first.user_values.get_arc::<VideoLayersAllocation>() {
             merged.user_values.set_arc(first_val);
+        }
+
+        if !first.user_values.is_empty() {
+            merged
+                .user_values
+                .set(FirstPacketUserValues(first.user_values.clone()));
         }
 
         merged
@@ -1009,6 +1017,16 @@ mod test {
                 .current_simulcast_stream_index,
         );
         assert_eq!(merged.video_orientation, Some(VideoOrientation::Deg90));
+        // The first packet's user values are kept whole.
+        let first_values = merged.user_values.get::<FirstPacketUserValues>().unwrap();
+        assert_eq!(
+            first_values
+                .0
+                .get::<VideoLayersAllocation>()
+                .unwrap()
+                .current_simulcast_stream_index,
+            1
+        );
     }
 
     #[test]

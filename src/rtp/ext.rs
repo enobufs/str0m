@@ -1091,6 +1091,22 @@ impl UserExtensionValues {
     }
 }
 
+/// The user extension values of the first packet of a received frame.
+///
+/// In frame mode, a received frame's [`ExtensionValues`] come from its last packet (some
+/// extensions are only sent there). Extensions that are only complete on the first packet,
+/// such as the Dependency Descriptor's template structure, are read from this value, which
+/// str0m sets in the frame's [`ExtensionValues::user_values`] when the first packet has user
+/// values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FirstPacketUserValues(pub UserExtensionValues);
+
+impl fmt::Debug for FirstPacketUserValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FirstPacketUserValues(..)")
+    }
+}
+
 /// Where an outgoing RTP packet sits within its frame.
 ///
 /// In frame mode, str0m's packetizer sets this in [`ExtensionValues::user_values`] of every
