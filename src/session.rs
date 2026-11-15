@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::Event;
 use crate::bwe::BweKind;
+use crate::bwe::TwccFeedbackState;
 use crate::bwe_::Bwe;
 use crate::config::KeyingMaterial;
 use crate::config_mod::RtcpReportIntervals;
@@ -1407,6 +1408,14 @@ impl Session {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.set_bitrate(minimum, desired);
             self.configure_pacer();
+        }
+    }
+
+    pub fn twcc_feedback_state(&self) -> TwccFeedbackState {
+        TwccFeedbackState {
+            data_in_flight: self.twcc_tx_register.data_in_flight(),
+            feedback_rtt: self.twcc_tx_register.last_feedback_rtt(),
+            reports: self.twcc_tx_register.reports(),
         }
     }
 

@@ -1,5 +1,7 @@
 //! Bandwidth estimation.
 
+use std::time::Duration;
+
 use crate::poll::RtcMut;
 use crate::{Rtc, rtp_::Mid};
 
@@ -34,6 +36,19 @@ pub enum BweKind {
         /// Media section associated with the report.
         mid: Mid,
     },
+}
+
+/// What the TWCC feedback says about data in flight, for congestion-window pushback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TwccFeedbackState {
+    /// Bytes sent with a transport-wide sequence number above the highest one any TWCC report
+    /// has covered (received or lost).
+    pub data_in_flight: usize,
+    /// Longest send-to-feedback time among the packets received in the last report.
+    pub feedback_rtt: Option<Duration>,
+    /// TWCC reports applied so far; changes when a new report arrives.
+    pub reports: u64,
 }
 
 /// Access to the Bandwidth Estimate subsystem.
@@ -89,6 +104,13 @@ impl<'a> Bwe<'a> {
         // Reconfiguring BWE only re-arms the estimator/pacer timers; any probing
         // padding is produced later from the timeout path, so no event is queued.
         m.no_events();
+    }
+
+    /// Data in flight and feedback round-trip time from TWCC, e.g. for congestion-window
+    /// pushback: lowering the encoder's input while more data is unacknowledged than the
+    /// estimate allows over a round trip.
+    pub fn feedback_state(&self) -> TwccFeedbackState {
+        self.0.session.twcc_feedback_state()
     }
 
     /// Reset the BWE with a new init_bitrate

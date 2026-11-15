@@ -1028,6 +1028,15 @@ pub struct TwccSendRegister {
 
     /// Last registered Twcc number.
     last_registered: TwccSeq,
+
+    /// Highest sequence number covered by a TWCC report (received or lost).
+    last_acked: Option<TwccSeq>,
+
+    /// Longest time from send to feedback among the packets received in the last report.
+    last_feedback_rtt: Option<Duration>,
+
+    /// TWCC reports applied.
+    reports: u64,
 }
 
 impl<'a> IntoIterator for &'a TwccSendRegister {
@@ -1176,7 +1185,31 @@ impl TwccSendRegister {
             time_zero: None,
             apply_report_counter: 0,
             last_registered: 0.into(),
+            last_acked: None,
+            last_feedback_rtt: None,
+            reports: 0,
         }
+    }
+
+    /// Bytes of registered packets above the highest sequence number any TWCC report has
+    /// covered: the data in flight (as libwebrtc's `TransportFeedbackAdapter` counts it).
+    pub fn data_in_flight(&self) -> usize {
+        self.queue
+            .iter()
+            .rev()
+            .take_while(|r| self.last_acked.is_none_or(|a| r.seq() > a))
+            .map(|r| usize::from(r.size))
+            .sum()
+    }
+
+    /// Longest send-to-feedback time among the packets received in the last report.
+    pub fn last_feedback_rtt(&self) -> Option<Duration> {
+        self.last_feedback_rtt
+    }
+
+    /// Number of TWCC reports applied so far.
+    pub fn reports(&self) -> u64 {
+        self.reports
     }
 
     pub fn register_seq(&mut self, packet_id: TwccPacketId, now: Instant, size: usize) {
@@ -1296,6 +1329,23 @@ impl TwccSendRegister {
         }
 
         let range = first_seq_no..=last_seq_no;
+
+        if self.last_acked.is_none_or(|a| last_seq_no > a) {
+            self.last_acked = Some(last_seq_no);
+        }
+        self.last_feedback_rtt = self
+            .queue
+            .range(first_index..)
+            .take_while(|r| r.seq() <= last_seq_no)
+            .filter(|r| {
+                r.recv_report.is_some_and(|rr| {
+                    rr.apply_report_counter == apply_report_counter && rr.remote_recv_time.is_some()
+                })
+            })
+            .map(|r| now.saturating_duration_since(r.local_send_time))
+            .max()
+            .or(self.last_feedback_rtt);
+        self.reports += 1;
 
         Some(
             TwccSendRecordsIter {
@@ -2264,6 +2314,53 @@ mod test {
 
         // The queue starts at 25: nothing left to apply 0..8 to.
         assert!(reg.apply_report(received(0, 8), now).is_none());
+    }
+
+    #[test]
+    fn test_twcc_send_register_data_in_flight() {
+        let mut reg = TwccSendRegister::new(25);
+        let start = Instant::now();
+        let mut now = start;
+        for i in 0..10 {
+            reg.register_seq(TwccPacketId::new(i), now, 100);
+            now = now + Duration::from_millis(10);
+        }
+        assert_eq!(reg.data_in_flight(), 1000, "nothing acknowledged yet");
+        assert_eq!(reg.reports(), 0);
+
+        // A report covering 0..=5: 0 and 1 lost, 2..=5 received.
+        now = now + Duration::from_millis(30);
+        #[allow(unused_must_use)]
+        reg.apply_report(
+            Twcc {
+                sender_ssrc: Ssrc::new(),
+                ssrc: Ssrc::new(),
+                base_seq: 0,
+                status_count: 6,
+                reference_time: 35,
+                feedback_count: 0,
+                chunks: [
+                    PacketChunk::Run(PacketStatus::NotReceived, 2),
+                    PacketChunk::Run(PacketStatus::ReceivedSmallDelta, 4),
+                ]
+                .into(),
+                delta: [
+                    Delta::Small(10),
+                    Delta::Small(10),
+                    Delta::Small(10),
+                    Delta::Small(10),
+                ]
+                .into(),
+            },
+            now,
+        );
+        assert_eq!(reg.data_in_flight(), 400, "6..=9 still in flight");
+        assert_eq!(reg.reports(), 1);
+        // Received packets 2..=5; the oldest (sent at start + 20 ms) had the longest wait.
+        assert_eq!(
+            reg.last_feedback_rtt(),
+            Some(now - (start + Duration::from_millis(20)))
+        );
     }
 
     #[test]
