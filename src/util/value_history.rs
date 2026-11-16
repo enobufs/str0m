@@ -28,6 +28,18 @@ impl<T> ValueHistory<T>
 where
     T: Copy + AddAssign + SubAssign + Sum,
 {
+    /// Empty history over `max_time`.
+    pub fn with_max_time(max_time: Duration) -> Self
+    where
+        T: Default,
+    {
+        Self {
+            value: T::default(),
+            history: VecDeque::new(),
+            max_time,
+        }
+    }
+
     /// Adds a timed value
     /// Note: time should always monotonically increase in subsequent calls to add()
     pub fn push(&mut self, t: Instant, v: T) {

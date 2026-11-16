@@ -46,6 +46,11 @@ pub(crate) struct StreamTxStats {
 }
 
 impl StreamTxStats {
+    /// Round-trip time from the last receiver report.
+    pub(crate) fn rtt(&self) -> Option<Duration> {
+        self.rtt
+    }
+
     pub fn new(enable_stats: bool) -> Self {
         Self {
             bytes: 0,

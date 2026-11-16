@@ -39,6 +39,15 @@ pub const DEFAULT_RTX_CACHE_DURATION: Duration = Duration::from_secs(3);
 
 pub const DEFAULT_RTX_RATIO_CAP: Option<f32> = Some(0.15f32);
 
+/// Window of the resend rate limit (as libwebrtc's retransmission rate limiter).
+const RESEND_RATE_WINDOW: Duration = Duration::from_millis(500);
+
+/// How long resend times are kept, to skip a packet resent less than an RTT ago.
+const RESEND_HISTORY: Duration = Duration::from_secs(1);
+
+/// RTT assumed before the first receiver report (libwebrtc's NACK module default).
+const DEFAULT_RESEND_RTT: Duration = Duration::from_millis(100);
+
 /// A recently sampled view of an outgoing stream's send queue.
 ///
 /// str0m refreshes this information as part of its regular pacer and bandwidth-estimation
@@ -144,6 +153,15 @@ pub struct StreamTx {
     /// Cache of sent packets to be able to answer to NACKs as well as
     /// sending spurious resends as padding.
     rtx_cache: RtxCache,
+
+    /// Resend budget in bps (see [`StreamTx::set_resend_rate_limit`]).
+    resend_rate_limit: Option<u64>,
+
+    /// Bytes queued for resend within the last [`RESEND_RATE_WINDOW`].
+    resend_bytes: ValueHistory<u64>,
+
+    /// When packets were last resent, oldest first (kept for [`RESEND_HISTORY`]).
+    resent_at: VecDeque<(SeqNo, Instant)>,
 
     /// Resends of packets before this one are dropped (see
     /// [`StreamTx::drop_resends_before_next_packet`]).
@@ -386,6 +404,9 @@ impl StreamTx {
             rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
             rtx_ratio_cap: DEFAULT_RTX_RATIO_CAP,
             resend_floor: None,
+            resend_rate_limit: None,
+            resend_bytes: ValueHistory::with_max_time(RESEND_RATE_WINDOW),
+            resent_at: VecDeque::new(),
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             pending_request_remb: None,
@@ -480,6 +501,37 @@ impl StreamTx {
             self.stats.bytes_retransmitted = None;
         }
         self.rtx_ratio_cap = rtx_ratio_cap;
+    }
+
+    /// Limit resends to `bps` over a 500 ms window, counted when a NACK is handled.
+    ///
+    /// This is how libwebrtc limits retransmissions (its rate limiter follows the target
+    /// rate): a NACK whose packets would exceed the budget has the rest of its packets
+    /// skipped, and packets already queued for resend are not queued again. Queued resends
+    /// are then all sent; combine it with `rtx_ratio_cap: None` in
+    /// [`StreamTx::set_rtx_cache`], since the ratio cap clears the whole queue when hit.
+    /// Call it again as the estimate changes. `None` (the default) turns the limit off.
+    pub fn set_resend_rate_limit(&mut self, bps: Option<u64>) {
+        self.resend_rate_limit = bps;
+        if bps.is_some() {
+            self.stats
+                .bytes_transmitted
+                .get_or_insert_with(ValueHistory::default);
+            self.stats
+                .bytes_retransmitted
+                .get_or_insert_with(ValueHistory::default);
+        }
+    }
+
+    /// Share of the last second's bytes that were resends: resent / (sent + resent).
+    ///
+    /// `None` unless `rtx_ratio_cap` or the resend rate limit is set. libwebrtc lowers its
+    /// encoder target by this share (with FEC, capped at 50 %), so media and resends together
+    /// stay within the estimate.
+    pub fn resend_share(&mut self, now: Instant) -> Option<f32> {
+        self.stats.bytes_transmitted.as_ref()?;
+        self.stats.bytes_retransmitted.as_ref()?;
+        Some(self.rtx_ratio_downsampled(now))
     }
 
     /// Stop resending packets written before the next one.
@@ -910,6 +962,10 @@ impl StreamTx {
         let pkt = self.rtx_cache.get_cached_packet_by_seq_no(seq_no).unwrap();
 
         let len = pkt.payload.len() as u64;
+        let orig = pkt.seq_no;
+        if self.resend_rate_limit.is_some() {
+            self.resent_at.push_back((orig, now));
+        }
         self.stats.update_packet_counts(len, true);
         if let Some(h) = &mut self.stats.bytes_retransmitted {
             h.push(now, len);
@@ -1079,6 +1135,21 @@ impl StreamTx {
         let seq_no = self.rtx_cache.last_cached_seq_no()?;
         let iter = entries.flat_map(|n| n.into_iter(seq_no));
 
+        let budget = self.resend_rate_limit.map(|bps| {
+            self.resend_bytes.purge_old(now);
+            while self
+                .resent_at
+                .front()
+                .is_some_and(|(_, t)| now.saturating_duration_since(*t) > RESEND_HISTORY)
+            {
+                self.resent_at.pop_front();
+            }
+            bps * RESEND_RATE_WINDOW.as_millis() as u64 / 8000
+        });
+        // As libwebrtc: not again within 5 ms + RTT of the last resend.
+        let min_interval =
+            Duration::from_millis(5) + self.stats.rtt().unwrap_or(DEFAULT_RESEND_RTT);
+
         // Schedule all resends. They will be handled on next poll_packet
         for seq_no in iter {
             if self.resend_floor.is_some_and(|f| seq_no < f) {
@@ -1088,11 +1159,30 @@ impl StreamTx {
                 // Packet was not available in RTX cache, it has probably expired.
                 continue;
             };
+            let payload_size = packet.payload.len();
+
+            if let Some(budget) = budget {
+                if self.resends.iter().any(|r| r.seq_no == seq_no) {
+                    continue;
+                }
+                let recently =
+                    self.resent_at.iter().rev().any(|(s, t)| {
+                        *s == seq_no && now.saturating_duration_since(*t) < min_interval
+                    });
+                if recently {
+                    continue;
+                }
+                if self.resend_bytes.sum() + payload_size as u64 > budget {
+                    // Over the budget: give up the rest of this NACK.
+                    break;
+                }
+                self.resend_bytes.push(now, payload_size as u64);
+            }
 
             let resend = Resend {
                 seq_no,
                 queued_at: now,
-                payload_size: packet.payload.len(),
+                payload_size,
             };
             self.resends.push_back(resend);
         }
@@ -1582,6 +1672,31 @@ mod test {
 
         stream.reset_buffers();
         assert_eq!(stream.resend_floor, None);
+    }
+
+    #[test]
+    fn resend_rate_limit_skips_rest_of_nack_over_budget() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        for seq_no in 1..=10u64 {
+            let mut pkt = RtpPacket::blank();
+            pkt.seq_no = seq_no.into();
+            pkt.payload = vec![0u8; 100].into();
+            pkt.nackable = true;
+            pkt.timestamp = now;
+            stream.rtx_cache.cache_sent_packet(pkt, now);
+        }
+        // 8 kbps over 500 ms is a 500 byte budget: five 100 byte packets.
+        stream.set_resend_rate_limit(Some(8_000));
+        let nack = || [NackEntry { pid: 1, blp: 0x1ff }].into_iter();
+        stream.handle_nack(nack(), now);
+        let queued: Vec<u64> = stream.resends.iter().map(|r| *r.seq_no).collect();
+        assert_eq!(queued, vec![1, 2, 3, 4, 5]);
+
+        // Once the window has passed, queued packets aren't queued again.
+        stream.handle_nack(nack(), now + Duration::from_millis(600));
+        let queued: Vec<u64> = stream.resends.iter().map(|r| *r.seq_no).collect();
+        assert_eq!(queued, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
