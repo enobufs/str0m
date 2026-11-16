@@ -145,6 +145,10 @@ pub struct StreamTx {
     /// sending spurious resends as padding.
     rtx_cache: RtxCache,
 
+    /// Resends of packets before this one are dropped (see
+    /// [`StreamTx::drop_resends_before_next_packet`]).
+    resend_floor: Option<SeqNo>,
+
     /// Determines retransmitted bytes ratio value to clear queued resends.
     rtx_ratio_cap: Option<f32>,
 
@@ -381,6 +385,7 @@ impl StreamTx {
             blank_packet: RtpPacket::blank(),
             rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
             rtx_ratio_cap: DEFAULT_RTX_RATIO_CAP,
+            resend_floor: None,
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
             pending_request_remb: None,
@@ -475,6 +480,18 @@ impl StreamTx {
             self.stats.bytes_retransmitted = None;
         }
         self.rtx_ratio_cap = rtx_ratio_cap;
+    }
+
+    /// Stop resending packets written before the next one.
+    ///
+    /// Call this before writing a keyframe the receiver asked for (PLI/FIR): it can't use
+    /// earlier packets any more. Queued resends of earlier packets are dropped and NACKs for
+    /// them are ignored from now on, so the link and the `rtx_ratio_cap` budget go to the
+    /// keyframe and what follows it.
+    pub fn drop_resends_before_next_packet(&mut self) {
+        let floor = self.seq_no;
+        self.resend_floor = Some(floor);
+        self.resends.retain(|r| r.seq_no >= floor);
     }
 
     /// Set whether this stream is unpaced or not.
@@ -1064,6 +1081,9 @@ impl StreamTx {
 
         // Schedule all resends. They will be handled on next poll_packet
         for seq_no in iter {
+            if self.resend_floor.is_some_and(|f| seq_no < f) {
+                continue;
+            }
             let Some(packet) = self.rtx_cache.get_cached_packet_by_seq_no(seq_no) else {
                 // Packet was not available in RTX cache, it has probably expired.
                 continue;
@@ -1325,6 +1345,7 @@ impl StreamTx {
         self.queue_info = None;
         self.rtx_cache.clear();
         self.resends.clear();
+        self.resend_floor = None;
         self.padding = 0;
     }
 
@@ -1540,6 +1561,27 @@ mod test {
         assert_eq!(second.header.ext_vals.transport_cc, Some(1));
         assert_eq!(second.header.ext_vals.mid, Some("vid".into()));
         assert_eq!(second.header.payload_type, 96.into());
+    }
+
+    #[test]
+    fn drop_resends_before_next_packet_keeps_later_resends() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        stream.seq_no = 8.into();
+        for seq_no in [5, 7, 8, 9] {
+            stream.resends.push_back(Resend {
+                seq_no: seq_no.into(),
+                queued_at: now,
+                payload_size: 100,
+            });
+        }
+        stream.drop_resends_before_next_packet();
+        let left: Vec<u64> = stream.resends.iter().map(|r| *r.seq_no).collect();
+        assert_eq!(left, vec![8, 9]);
+        assert_eq!(stream.resend_floor, Some(8.into()));
+
+        stream.reset_buffers();
+        assert_eq!(stream.resend_floor, None);
     }
 
     #[test]
